@@ -1,0 +1,212 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use LWP::RobotUA;
+use XML::FeedPP;
+use MIME::Lite;
+use Digest::SHA1 qw( sha1_hex );
+use File::Slurp qw( write_file );
+use Config::Tiny;
+use Encode qw(encode);
+use Proc::PID::File;
+use HTML::Selector::XPath;
+use HTML::TreeBuilder::XPath;
+use File::Spec::Functions qw(catfile splitpath);
+use File::Path qw(mkpath);
+use File::Find::Rule;
+use Getopt::Long;
+use HTML::Entities;
+
+my %options = ( verbose => 0 );
+GetOptions(\%options,
+	'feed=s',
+	'hash=s',
+	'verbose!',
+);
+
+my $pid         = Proc::PID::File->new( dir => '/var/tmp' );
+my $clean_cache = 1;
+my $start_time  = time();
+
+if ( $options{feed} or $options{hash} ) {
+	$clean_cache = 0;
+}
+
+die "Already running!" if $pid->alive();
+
+my $config_file = $ARGV[0];
+my $feed_config = Config::Tiny->read( $ARGV[0] )
+  or die Config::Tiny->errstr() . "\n";
+my $general_config = delete $feed_config->{_};
+
+( my $workdir = $general_config->{workdir} || "~/.feeder" ) =~ s/~/$ENV{HOME}/e;
+my $mail_to = $general_config->{mail_to};
+
+{
+    my %cache;
+    my $ua = LWP::RobotUA->new(
+        agent      => 'feeder',
+        from       => 'mario@domgoergen.com',
+        delay      => 0.05,
+        cookie_jar => {},
+        env_proxy  => 1,
+    );
+
+    sub http_get {
+        my ($url) = @_;
+        $cache{$url} = $ua->get($url) if !exists $cache{$url};
+        return $cache{$url};
+    }
+
+    sub hash_for_url {
+        my ($url) = @_;
+        return sha1_hex($url);
+    }
+
+    sub filename_for_url {
+        my ($url) = @_;
+        my $hash = hash_for_url($url);
+        my $filename =
+          catfile( $workdir, 'cache', substr( $hash, 0, 1 ), $hash );
+        return $filename;
+    }
+
+    sub mail_already_sent {
+        my ($url) = @_;
+        my $filename = filename_for_url($url);
+        if ( -e $filename ) {
+            touch($filename);
+            return 1;
+        }
+        else {
+            return;
+        }
+    }
+
+    sub mark_as_sent {
+        my ($url) = @_;
+        return touch( filename_for_url($url) );
+    }
+}
+
+while ( my ( $tag, $config ) = each %{$feed_config} ) {
+
+	if ( $options{feed} and $options{feed} ne $tag ) {
+		next;
+	}
+
+    my $url     = $config->{url};
+    my $reponse = http_get($url);
+    if ( $reponse->is_success() ) {
+
+        warn "Processing feed $url\n" if $options{verbose};
+
+        my $content = $reponse->decoded_content();
+        my $feed    = eval { XML::FeedPP->new($content) };
+
+	## TODO Try::Tiny
+	if ($@) {
+		warn "$url: $@\n";
+		next;
+	}
+
+        for my $entry ( $feed->get_item() ) {
+
+            my $subject = encode( 'MIME-Q', decode_entities($entry->title() || '' ));
+            my $url = $entry->link() || '';
+            my $body =
+              encode( 'utf-8',
+                $entry->get('content:encoded') || $entry->description() || '' );
+
+	if ($options{hash} and $options{hash} ne hash_for_url($url)) {
+		warn "Not matching $options{hash}" if $options{verbose};
+		next;
+	}
+
+            if ( !$url ) {
+                warn "Contains no link. Skipped.\n";
+            }
+
+           if ( mail_already_sent($url) ) {
+                warn "$url already fetched and send. Skipped.\n" if $options{verbose};
+                next;
+            }
+
+            if ( $config->{selector} ) {
+                $body = '';
+                my @urls = ($url);
+                if ( $config->{multipage} ) {
+                    push @urls, get_all_pages( $url, $config->{multipage} );
+                }
+                for my $url (@urls) {
+                    $body .=
+                      encode( 'utf-8',
+                        get_content( $url, $config->{selector} ) );
+                }
+            }
+            $body .= qq{<p><a href="$url">Show Article</a></p>};
+
+            my $msg = MIME::Lite->new(
+                From    => "$tag <dom\@math.uni-bonn.de>",
+                To      => $mail_to,
+                Subject => $subject,
+                Data    => $body,
+                Type    => 'text/html',
+            );
+            $msg->attr( 'content-type.charset' => 'UTF8' );
+            $msg->add( 'User-Agent'    => 'feeder' );
+            $msg->add( 'X-Feeder-Hash' => hash_for_url($url) );
+            $msg->add( 'X-Feeder-URL'  => $url );
+
+            $msg->send();
+            warn "Mail send for $url.\n" if $options{verbose};
+            mark_as_sent($url);
+        }
+    }
+    else {
+        ## Don't clean files if any feed does not return!
+        $clean_cache = 0;
+    }
+}
+
+if ($clean_cache) {
+    my @files = find(
+        file => mtime => "< $start_time",
+        in => catfile( $workdir, 'cache' )
+    );
+    unlink @files;
+}
+
+sub get_all_pages {
+    my ( $url, $selector ) = @_;
+
+    my $response = http_get($url);
+    my $tree =
+      HTML::TreeBuilder::XPath->new->parse( $response->decoded_content() )->eof;
+    my $xpath = HTML::Selector::XPath->new($selector)->to_xpath;
+    my @urls;
+    for my $elem ( $tree->findnodes($xpath) ) {
+        my $rel_url  = $elem->attr_get_i('href');
+        my $base_url = $response->base;
+        push @urls, URI->new_abs( $rel_url, $base_url );
+    }
+    return @urls;
+}
+
+sub get_content {
+    my ( $url, $selector ) = @_;
+    my $response = http_get($url);
+    my $tree =
+      HTML::TreeBuilder::XPath->new->parse( $response->decoded_content )->eof;
+    my $xpath = HTML::Selector::XPath->new($selector)->to_xpath;
+    return $tree->findnodes_as_string($xpath);
+}
+
+sub touch {
+    my $file = shift;
+    my ( undef, $directory, undef ) = splitpath($file);
+    makepath($directory) if !-e $directory;
+    open( my $fh, '+>', $file );
+}

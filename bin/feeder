@@ -1,0 +1,183 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use Config::Tiny;
+use File::Find::Rule;
+use HTML::Entities qw(decode_entities);
+use LWP::UserAgent;
+use MIME::Lite;
+use Parallel::ForkManager;
+use Proc::PID::File;
+use Try::Tiny;
+use XML::FeedPP;
+use File::Spec::Functions qw(catfile splitpath);
+use App::Feeder::PageContent qw(get_content);
+use File::Path qw(make_path);
+use Digest::SHA1 qw( sha1_hex );
+use Encode qw(encode);
+
+my $clean_cache = 1;
+my $start_time  = time();
+
+Proc::PID::File->new( dir => '/var/tmp' )->alive()
+  and die "Already running!";
+
+my ( $config, $feed_config ) = get_config(@ARGV);
+my $ua = get_ua( $config->{http_proxy}, $config->{https_proxy} );
+
+my $workdir   = $config->{workdir} || "$ENV{HOME}/.feeder";
+my $mail_to   = $config->{mail_to};
+my $mail_from = $config->{mail_from} || $ENV{USER};
+
+my $pm = Parallel::ForkManager->new(10);
+
+$pm->run_on_finish(
+    sub {
+        my ( $pid, $exit_code, $ident ) = @_;
+        $clean_cache = 0 if $exit_code == 0;
+    }
+);
+
+while ( my ( $tag, $config ) = each %{$feed_config} ) {
+
+    my $pid = $pm->start($tag) and next;
+
+    my $url      = $config->{url};
+    my $response = $ua->get($url);
+
+    if ( !$response->is_success() ) {
+        warn "Error getting $url: " . $response->status_line . "\n";
+        $pm->finish(1);
+    }
+
+    my $feed = try { XML::FeedPP->new( $response->decoded_content() ) }
+    catch {
+        warn "$url: $_\n";
+        $pm->finish(1);
+    };
+
+    for my $entry ( $feed->get_item() ) {
+
+        my $url     = encode('utf-8',$entry->link());
+
+        next if mail_already_sent($url);
+
+        my $body    = $entry->get('content:encoded') || $entry->description();
+        my $subject = encode_subject( $entry->title() );
+
+        if ( $config->{selector} ) {
+            $body = get_content(
+                ua        => $ua,
+                selector  => $config->{selector},
+                multipage => $config->{multipage},
+                url       => $url,
+            );
+        }
+
+        $body .= qq{<p><a href="$url">Show Article</a></p>};
+        send_mail( $tag, $subject, $body, $url );
+    }
+
+    $pm->finish;
+}
+
+$pm->wait_all_children;
+
+clean_cache() if $clean_cache;
+
+sub clean_cache {
+    my @files = find(
+        file => mtime => "< $start_time",
+        in => catfile( $workdir, 'cache' )
+    );
+
+    unlink @files if @files;
+}
+
+sub send_mail {
+    my ( $tag, $subject, $body, $url ) = @_;
+    $body = encode( 'utf-8', $body );
+    my $msg = MIME::Lite->new(
+        From    => "$tag <$mail_from>",
+        To      => $mail_to,
+        Subject => $subject,
+        Data    => $body,
+        Type    => 'text/html',
+    );
+    $msg->attr( 'content-type.charset' => 'UTF8' );
+    $msg->add( 'User-Agent'    => 'feeder' );
+    $msg->add( 'X-Feeder-Hash' => hash_for_url($url) );
+    $msg->add( 'X-Feeder-URL'  => $url );
+
+    $msg->send();
+    mark_as_sent($url);
+    return;
+}
+
+sub touch {
+    my $file = shift;
+    my ( undef, $directory, undef ) = splitpath($file);
+    make_path($directory) if !-e $directory;
+    open( my $fh, '>', $file ) or die "Can't truncate $file: $!\n";
+}
+
+sub encode_subject {
+    return encode( 'MIME-Q', decode_entities( $_[0] ) );
+}
+
+sub hash_for_url {
+    my ($url) = @_;
+    return sha1_hex($url);
+}
+
+sub filename_for_url {
+    my ($url) = @_;
+    my $hash = hash_for_url($url);
+    my $filename = catfile( $workdir, 'cache', substr( $hash, 0, 1 ), $hash );
+    return $filename;
+}
+
+sub mail_already_sent {
+    my ($url) = @_;
+    my $filename = filename_for_url($url);
+    if ( -e $filename ) {
+        touch($filename);
+        return 1;
+    }
+    else {
+        return 0;
+    }
+}
+
+sub mark_as_sent {
+    my ($url) = @_;
+    my $filename = filename_for_url($url);
+    touch($filename);
+    return;
+}
+
+sub get_config {
+    my $config_file = $_[0] || "$ENV{HOME}/.feederrc";
+    my $feed_config = Config::Tiny->read($config_file)
+      or die Config::Tiny->errstr() . "\n";
+    my $general_config = delete $feed_config->{_};
+    return $general_config, $feed_config;
+}
+
+sub get_ua {
+    my ( $http_proxy, $https_proxy ) = @_;
+
+    my $ua = LWP::UserAgent->new( cookie_jar => {}, );
+    if ( not defined $http_proxy ) {
+        $ua->env_proxy();
+    }
+    if ( defined $http_proxy ) {
+        $ua->proxy( 'http', $http_proxy );
+    }
+    if ($https_proxy) {
+        $ua->proxy( 'https', $https_proxy );
+    }
+    return $ua;
+}
